@@ -170,6 +170,7 @@ class BatchedInferencePipeline:
                 options.append_punctuations,
                 self.last_speech_timestamp,
             )
+        del encoder_output
 
         return segmented_outputs
 
