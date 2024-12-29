@@ -582,7 +582,7 @@ class BatchedInferencePipeline:
                         temperature=options.temperatures[0],
                     )
 
-                pbar.update(features.shape[0])
+                    pbar.update(1)
 
         pbar.close()
         self.last_speech_timestamp = 0.0
