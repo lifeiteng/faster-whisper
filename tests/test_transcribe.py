@@ -240,6 +240,8 @@ def test_transcribe_signature():
         inspect.getargs(BatchedInferencePipeline.transcribe.__code__).args
     )
     pipeline_transcribe_args.remove("batch_size")
+    pipeline_transcribe_args.remove("num_workers")
+    pipeline_transcribe_args.remove("prefetch_factor")
 
     assert model_transcribe_args == pipeline_transcribe_args
 

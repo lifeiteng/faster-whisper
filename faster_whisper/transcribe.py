@@ -7,8 +7,9 @@ import zlib
 from dataclasses import asdict, dataclass
 from inspect import signature
 from math import ceil
-from typing import BinaryIO, Iterable, List, Optional, Tuple, Union
+from typing import BinaryIO, Iterable, List, Optional, Tuple, Union, Dict
 from warnings import warn
+from torch.utils.data import DataLoader, Dataset, SequentialSampler, BatchSampler
 
 import ctranslate2
 import numpy as np
@@ -294,6 +295,8 @@ class BatchedInferencePipeline:
         clip_timestamps: Optional[List[dict]] = None,
         hallucination_silence_threshold: Optional[float] = None,
         batch_size: int = 8,
+        num_workers: int = 4,
+        prefetch_factor: int = 2,
         hotwords: Optional[str] = None,
         language_detection_threshold: Optional[float] = 0.5,
         language_detection_segments: int = 1,
@@ -430,12 +433,7 @@ class BatchedInferencePipeline:
             format_timestamp(duration - duration_after_vad),
         )
 
-        audio_chunks, chunks_metadata = collect_chunks(audio, clip_timestamps)
-        features = (
-            [self.model.feature_extractor(chunk)[..., :-1] for chunk in audio_chunks]
-            if duration_after_vad
-            else []
-        )
+        dataset = BatchFeaturesDataset(self.model.feature_extractor, audio, clip_timestamps, sampling_rate=16000)
 
         all_language_probs = None
         # detecting the language if not provided
@@ -444,6 +442,7 @@ class BatchedInferencePipeline:
                 language = "en"
                 language_probability = 1
             else:
+                features = [dataset.__getitem__([i])[0][0] for i in range(min(language_detection_segments, len(clip_timestamps)))]
                 (
                     language,
                     language_probability,
@@ -480,10 +479,6 @@ class BatchedInferencePipeline:
             self.model.model.is_multilingual,
             task=task,
             language=language,
-        )
-
-        features = (
-            np.stack([pad_or_trim(feature) for feature in features]) if features else []
         )
 
         options = TranscriptionOptions(
@@ -533,11 +528,19 @@ class BatchedInferencePipeline:
             all_language_probs=all_language_probs,
         )
 
+        dataloader = DataLoader(dataset,
+                                sampler=BatchSampler(SequentialSampler(clip_timestamps), batch_size=batch_size, drop_last=False),
+                                batch_sampler=None,
+                                batch_size=None,
+                                shuffle=False,
+                                num_workers=num_workers or 1,
+                                prefetch_factor=prefetch_factor,
+                                collate_fn=lambda x: x,
+                                drop_last=False)
+
         segments = self._batched_segments_generator(
-            features,
+            dataloader,
             tokenizer,
-            chunks_metadata,
-            batch_size,
             options,
             log_progress,
         )
@@ -545,15 +548,16 @@ class BatchedInferencePipeline:
         return segments, info
 
     def _batched_segments_generator(
-        self, features, tokenizer, chunks_metadata, batch_size, options, log_progress
+        self, dataloader, tokenizer, options, log_progress
     ):
-        pbar = tqdm(total=len(features), disable=not log_progress, position=0)
+        pbar = tqdm(total=len(dataloader.dataset), disable=not log_progress, position=0)
         seg_idx = 0
-        for i in range(0, len(features), batch_size):
+        for batch in dataloader:
+            features, metadata = batch
             results = self.forward(
-                features[i : i + batch_size],
+                features,
                 tokenizer,
-                chunks_metadata[i : i + batch_size],
+                metadata,
                 options,
             )
 
@@ -578,10 +582,36 @@ class BatchedInferencePipeline:
                         temperature=options.temperatures[0],
                     )
 
-                pbar.update(1)
+                pbar.update(features.shape[0])
 
         pbar.close()
         self.last_speech_timestamp = 0.0
+
+
+
+class BatchFeaturesDataset(Dataset):
+    def __init__(self, feature_extractor, audio: np.ndarray, timestamps: List[Dict[str, float]], sampling_rate: int = 16000):
+        self.feature_extractor = feature_extractor
+        self.audio = audio
+        self.timestamps = timestamps
+        self.sampling_rate = sampling_rate
+
+    def __len__(self):
+        return len(self.timestamps)
+
+    def __getitem__(self, indexs: List[int]):
+        audios, metadata = [], []
+        for index in indexs:
+            chunk = self.timestamps[index]
+            audios.append(self.audio[chunk["start"] : chunk["end"]])
+            metadata.append({
+                "start_time": chunk["start"] / self.sampling_rate,
+                "end_time": chunk["end"] / self.sampling_rate,
+            })
+
+        features = [self.feature_extractor(chunk)[..., :-1] for chunk in audios]
+        features = np.stack([pad_or_trim(feature) for feature in features])
+        return features, metadata
 
 
 class WhisperModel:
